@@ -2,10 +2,11 @@
 # -*- coding: utf-8 -*-
 
 import os
-import re
 import json
 import hashlib
 import base64
+import shutil
+from pathlib import Path
 
 import cloudscraper
 from bs4 import BeautifulSoup
@@ -16,9 +17,12 @@ import requests
 BRIGHTNESS_THRESHOLD = 130
 BATCH_SIZE = 100
 TEMP_DIR = "temp_download"
+LOCAL_DIR = "local_images"
 
-# 起始ID（首次运行时使用）
+# 起始ID
 START_ID = 342
+# 最大连续404次数（真正的结束）
+MAX_404_COUNT = 5
 
 # 目标私有仓库
 TARGET_REPO = os.environ.get("TARGET_REPO", "")
@@ -37,7 +41,6 @@ scraper = cloudscraper.create_scraper(
 # ============ GitHub API ============
 
 def github_get_sha(path: str) -> str | None:
-    """只获取文件的SHA（用于二进制文件检查）"""
     if not GITHUB_TOKEN or not TARGET_REPO:
         return None
     
@@ -57,7 +60,6 @@ def github_get_sha(path: str) -> str | None:
 
 
 def github_get_json(path: str) -> tuple:
-    """获取JSON文件内容和SHA"""
     if not GITHUB_TOKEN or not TARGET_REPO:
         return None, None
     
@@ -78,10 +80,8 @@ def github_get_json(path: str) -> tuple:
     return None, None
 
 
-def github_upload(path: str, content: bytes, message: str) -> bool:
-    """上传文件到目标仓库"""
+def github_upload(path: str, content: bytes, message: str, sha: str = None) -> bool:
     if not GITHUB_TOKEN or not TARGET_REPO:
-        print("❌ 缺少 GITHUB_TOKEN 或 TARGET_REPO")
         return False
     
     url = f"https://api.github.com/repos/{TARGET_REPO}/contents/{path}"
@@ -89,9 +89,6 @@ def github_upload(path: str, content: bytes, message: str) -> bool:
         "Authorization": f"token {GITHUB_TOKEN}",
         "Accept": "application/vnd.github.v3+json"
     }
-    
-    # 获取现有文件的SHA（用于更新）
-    sha = github_get_sha(path)
     
     data = {
         "message": message,
@@ -110,7 +107,6 @@ def github_upload(path: str, content: bytes, message: str) -> bool:
 
 
 def get_remote_json(path: str, default=None) -> dict:
-    """从目标仓库获取JSON文件"""
     content, _ = github_get_json(path)
     if content:
         try:
@@ -121,19 +117,77 @@ def get_remote_json(path: str, default=None) -> dict:
 
 
 def save_remote_json(path: str, data: dict, msg: str) -> bool:
-    """保存JSON到目标仓库"""
+    sha = github_get_sha(path)
     content = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
-    return github_upload(path, content, msg)
+    return github_upload(path, content, msg, sha)
 
 
-# ============ URL 处理 ============
-
-def build_url(page_id: int) -> str:
-    """根据ID构建完整URL"""
-    return f"https://img.hyun.cc/index.php/archives/{page_id}.html"
+def batch_upload_to_github(upload_queue: list, hash_registry: dict, 
+                           folder_counts: dict, last_id: int) -> bool:
+    """批量上传所有文件到GitHub"""
+    if not upload_queue:
+        print("📭 没有需要上传的文件")
+        return True
+    
+    print(f"\n{'='*50}")
+    print(f"📤 开始批量上传 {len(upload_queue)} 个文件")
+    print(f"{'='*50}\n")
+    
+    success_count = 0
+    fail_count = 0
+    
+    for idx, item in enumerate(upload_queue, 1):
+        local_path = item["local_path"]
+        remote_path = item["remote_path"]
+        file_hash = item["hash"]
+        
+        print(f"[{idx}/{len(upload_queue)}] {remote_path}", end=" ")
+        
+        try:
+            with open(local_path, "rb") as f:
+                content = f.read()
+            
+            if github_upload(remote_path, content, f"Add {remote_path}"):
+                hash_registry[file_hash] = remote_path.replace(f"{IMAGES_DIR}/", "")
+                success_count += 1
+                print("✅")
+            else:
+                fail_count += 1
+                print("❌")
+                folder = remote_path.split("/")[-2]
+                if folder in folder_counts:
+                    folder_counts[folder] -= 1
+        except Exception as e:
+            fail_count += 1
+            print(f"❌ {e}")
+    
+    print(f"\n📊 上传完成: 成功 {success_count}, 失败 {fail_count}")
+    
+    # 上传元数据
+    if success_count > 0:
+        print("\n📝 更新元数据...")
+        
+        if save_remote_json(f"{IMAGES_DIR}/hash_registry.json", hash_registry,
+                           f"Update hash_registry (+{success_count})"):
+            print("  ✅ hash_registry.json")
+        
+        if save_remote_json(f"{IMAGES_DIR}/count.json", folder_counts, "Update count"):
+            print("  ✅ count.json")
+        
+        # 更新进度
+        progress = get_remote_json("progress.json", {"last_id": START_ID - 1})
+        progress["last_id"] = last_id
+        if save_remote_json("progress.json", progress, f"Update progress to {last_id}"):
+            print("  ✅ progress.json")
+    
+    return fail_count == 0
 
 
 # ============ 工具函数 ============
+
+def build_url(page_id: int) -> str:
+    return f"https://img.hyun.cc/index.php/archives/{page_id}.html"
+
 
 def get_file_hash(filepath: str) -> str:
     sha256 = hashlib.sha256()
@@ -143,19 +197,37 @@ def get_file_hash(filepath: str) -> str:
     return sha256.hexdigest()
 
 
+def ensure_dir(path: str):
+    Path(path).mkdir(parents=True, exist_ok=True)
+
+
 # ============ 图片处理 ============
 
-def scrape_images(url: str) -> list:
-    """爬取页面中的图片链接"""
+def scrape_images(url: str) -> tuple:
+    """
+    爬取页面中的图片链接
+    返回: (images_list, status)
+    status: "ok" | "video" | "404" | "error"
+    """
     print(f"🌐 爬取: {url}")
     
     try:
         resp = scraper.get(url, timeout=30)
+        
+        # 检查404
+        if resp.status_code == 404:
+            return [], "404"
+        
         resp.raise_for_status()
         resp.encoding = 'utf-8'
+    except requests.exceptions.HTTPError as e:
+        if "404" in str(e):
+            return [], "404"
+        print(f"❌ 请求失败: {e}")
+        return [], "error"
     except Exception as e:
         print(f"❌ 请求失败: {e}")
-        return []
+        return [], "error"
     
     soup = BeautifulSoup(resp.text, "lxml")
     images = []
@@ -165,8 +237,13 @@ def scrape_images(url: str) -> list:
         if href.startswith("http"):
             images.append({"url": href, "index": idx})
     
+    if not images:
+        # 没有图片，可能是视频页面
+        print(f"🎬 无图片（视频页面），跳过")
+        return [], "video"
+    
     print(f"📷 找到 {len(images)} 张图片")
-    return images
+    return images, "ok"
 
 
 def download_image(url: str, save_path: str) -> bool:
@@ -220,43 +297,35 @@ def analyze_image(path: str) -> dict | None:
         return None
 
 
-# ============ 页面处理 ============
+# ============ 本地处理 ============
 
-def process_page(page_id: int) -> str:
+def process_page_local(page_id: int, hash_registry: dict, folder_counts: dict, 
+                       upload_queue: list) -> str:
     """
-    处理单个页面
-    返回: "success" | "empty" | "error"
+    本地处理单个页面
+    返回: "success" | "video" | "404" | "error"
     """
     url = build_url(page_id)
     
     print(f"\n{'='*50}")
-    print(f"📂 处理页面 ID: {page_id}")
-    print(f"🔗 {url}")
-    print(f"{'='*50}\n")
+    print(f"📂 页面 ID: {page_id}")
+    print(f"{'='*50}")
     
-    os.makedirs(TEMP_DIR, exist_ok=True)
+    ensure_dir(TEMP_DIR)
     
     # 爬取图片
-    images = scrape_images(url)
-    if not images:
-        return "empty"
+    images, status = scrape_images(url)
     
-    # 获取远程数据
-    hash_registry = get_remote_json(f"{IMAGES_DIR}/hash_registry.json", {})
-    folder_counts = get_remote_json(f"{IMAGES_DIR}/count.json", {})
-    
-    for f in FOLDERS:
-        if f not in folder_counts:
-            folder_counts[f] = 0
+    if status != "ok":
+        return status
     
     new_count = 0
     
     for img in images[:BATCH_SIZE]:
         idx = img["index"]
-        temp_path = os.path.join(TEMP_DIR, f"temp_{idx}")
-        webp_path = os.path.join(TEMP_DIR, f"temp_{idx}.webp")
+        temp_path = os.path.join(TEMP_DIR, f"temp_{page_id}_{idx}")
         
-        print(f"\n📥 [{idx}/{len(images)}] 下载中...")
+        print(f"📥 [{idx}/{len(images)}] 下载中...")
         
         if not download_image(img["url"], temp_path):
             continue
@@ -274,53 +343,35 @@ def process_page(page_id: int) -> str:
             os.remove(temp_path)
             continue
         
-        # 转换格式
-        if not convert_to_webp(temp_path, webp_path):
-            os.remove(temp_path)
-            continue
-        os.remove(temp_path)
-        
         # 确定目标路径
         target_folder = info["folder"]
         folder_counts[target_folder] += 1
         new_num = folder_counts[target_folder]
-        remote_path = f"{IMAGES_DIR}/{target_folder}/{new_num}.webp"
         
-        # 上传图片到目标仓库
-        with open(webp_path, "rb") as f:
-            webp_data = f.read()
+        # 本地保存
+        local_folder = os.path.join(LOCAL_DIR, IMAGES_DIR, target_folder)
+        ensure_dir(local_folder)
+        local_path = os.path.join(local_folder, f"{new_num}.webp")
         
-        if github_upload(remote_path, webp_data, f"Add {target_folder}/{new_num}.webp"):
-            hash_registry[file_hash] = f"{target_folder}/{new_num}.webp"
-            new_count += 1
-            print(f"  ✅ 上传: {remote_path}")
-        else:
+        if not convert_to_webp(temp_path, local_path):
+            os.remove(temp_path)
             folder_counts[target_folder] -= 1
-            print(f"  ❌ 上传失败")
+            continue
+        os.remove(temp_path)
         
-        os.remove(webp_path)
+        # 添加到上传队列
+        remote_path = f"{IMAGES_DIR}/{target_folder}/{new_num}.webp"
+        upload_queue.append({
+            "local_path": local_path,
+            "remote_path": remote_path,
+            "hash": file_hash
+        })
+        
+        hash_registry[file_hash] = f"{target_folder}/{new_num}.webp"
+        new_count += 1
+        print(f"  💾 {local_path}")
     
-    # 保存元数据到目标仓库
-    if new_count > 0:
-        save_remote_json(
-            f"{IMAGES_DIR}/hash_registry.json", 
-            hash_registry, 
-            f"Update hash_registry (page {page_id})"
-        )
-        save_remote_json(
-            f"{IMAGES_DIR}/count.json", 
-            folder_counts, 
-            f"Update count (page {page_id})"
-        )
-        print(f"\n💾 已更新 count.json 和 hash_registry.json")
-    
-    # 清理临时目录
-    if os.path.exists(TEMP_DIR):
-        for f in os.listdir(TEMP_DIR):
-            os.remove(os.path.join(TEMP_DIR, f))
-        os.rmdir(TEMP_DIR)
-    
-    print(f"\n✅ 页面 {page_id} 完成，新增 {new_count} 张")
+    print(f"✅ 页面 {page_id} 完成，新增 {new_count} 张")
     return "success"
 
 
@@ -329,74 +380,110 @@ def process_page(page_id: int) -> str:
 def main():
     print("🚀 开始运行\n")
     
-    # 检查配置
     if not GITHUB_TOKEN:
-        print("❌ 缺少 GH_TOKEN 环境变量")
+        print("❌ 缺少 GH_TOKEN")
         return
     if not TARGET_REPO:
-        print("❌ 缺少 TARGET_REPO 环境变量")
+        print("❌ 缺少 TARGET_REPO")
         return
     
     print(f"📦 目标仓库: {TARGET_REPO}")
     print(f"📁 存储目录: /{IMAGES_DIR}/\n")
     
-    # 从目标仓库读取进度
-    progress = get_remote_json("progress.json", {
-        "completed": [],
-        "last_success_id": START_ID - 1
-    })
+    # 获取远程数据
+    print("📥 获取远程数据...")
+    progress = get_remote_json("progress.json", {"last_id": START_ID - 1})
+    hash_registry = get_remote_json(f"{IMAGES_DIR}/hash_registry.json", {})
+    folder_counts = get_remote_json(f"{IMAGES_DIR}/count.json", {})
     
-    # 确保字段存在
-    if "completed" not in progress:
-        progress["completed"] = []
-    if "last_success_id" not in progress:
-        progress["last_success_id"] = START_ID - 1
+    for f in FOLDERS:
+        if f not in folder_counts:
+            folder_counts[f] = 0
     
-    completed_set = set(progress["completed"])
-    current_id = progress["last_success_id"] + 1
+    current_id = progress.get("last_id", START_ID - 1) + 1
+    print(f"📍 从 ID {current_id} 开始\n")
     
-    print(f"📊 已完成: {len(progress['completed'])} 个页面")
-    print(f"📍 上次成功ID: {progress['last_success_id']}")
-    print(f"📍 本次从 ID {current_id} 开始\n")
+    # 准备本地目录
+    if os.path.exists(LOCAL_DIR):
+        shutil.rmtree(LOCAL_DIR)
+    ensure_dir(LOCAL_DIR)
     
-    # 循环处理
+    upload_queue = []
+    last_success_id = current_id - 1
+    consecutive_404 = 0
+    
+    # ========== 阶段1: 本地处理 ==========
+    print("=" * 60)
+    print("📥 阶段1: 本地下载和处理")
+    print("=" * 60)
+    
     while True:
-        current_url = build_url(current_id)
-        
-        # 检查是否已完成
-        if current_url in completed_set:
-            print(f"⏭️ ID {current_id} 已完成，跳过")
-            current_id += 1
-            continue
-        
-        result = process_page(current_id)
+        result = process_page_local(
+            current_id, 
+            hash_registry, 
+            folder_counts, 
+            upload_queue
+        )
         
         if result == "success":
-            # ✅ 成功，更新进度
-            progress["completed"].append(current_url)
-            progress["last_success_id"] = current_id
+            last_success_id = current_id
+            consecutive_404 = 0
+            current_id += 1
             
-            save_remote_json(
-                "progress.json", 
-                progress, 
-                f"Complete: {current_url}"
-            )
-            print(f"💾 进度已保存: ID {current_id}\n")
+        elif result == "video":
+            # 视频页面，跳过继续
+            last_success_id = current_id  # 也算处理过了
+            consecutive_404 = 0
+            current_id += 1
+            
+        elif result == "404":
+            consecutive_404 += 1
+            print(f"⚠️ 404 (连续: {consecutive_404}/{MAX_404_COUNT})")
+            
+            if consecutive_404 >= MAX_404_COUNT:
+                print(f"\n⏹️ 连续 {MAX_404_COUNT} 个404，到达末尾")
+                break
             
             current_id += 1
             
-        elif result == "empty":
-            # ⏹️ 没有图片，停止执行
-            print(f"\n⏹️ 页面 {current_id} 没有图片，停止执行")
-            print(f"💡 下次运行将继续尝试: {current_url}")
-            break
-            
         else:
-            # ❌ 出错，停止
+            # 出错
             print(f"\n❌ 处理出错，停止")
             break
     
-    print("\n🏁 运行结束")
+    # 清理临时目录
+    if os.path.exists(TEMP_DIR):
+        shutil.rmtree(TEMP_DIR)
+    
+    # ========== 阶段2: 批量上传 ==========
+    print("\n" + "=" * 60)
+    print("📤 阶段2: 批量上传到 GitHub")
+    print("=" * 60)
+    
+    if upload_queue:
+        print(f"\n📊 待上传: {len(upload_queue)} 个文件")
+        for f in FOLDERS:
+            count = sum(1 for item in upload_queue if f"/{f}/" in item["remote_path"])
+            if count > 0:
+                print(f"   {f}: {count} 张")
+        
+        batch_upload_to_github(
+            upload_queue, 
+            hash_registry, 
+            folder_counts, 
+            last_success_id
+        )
+    else:
+        print("\n📭 没有新图片")
+        # 仍然更新进度
+        progress["last_id"] = last_success_id
+        save_remote_json("progress.json", progress, f"Update progress to {last_success_id}")
+    
+    # 清理
+    if os.path.exists(LOCAL_DIR):
+        shutil.rmtree(LOCAL_DIR)
+    
+    print("\n🏁 完成")
 
 
 if __name__ == "__main__":
