@@ -13,7 +13,6 @@ Pella 自动续期脚本 (增强稳定性 - 使用 JavaScript 强制输入绕过
     - TG_BOT_TOKEN=Telegram 机器人 Token
     - TG_CHAT_ID=Telegram 聊天 ID
 """
-
 import os
 import time
 import logging
@@ -52,7 +51,7 @@ class PellaAutoRenew:
         chrome_options = Options()
         
         if os.getenv('GITHUB_ACTIONS'):
-            chrome_options.add_argument('--headless')
+            chrome_options.add_argument('--headless=new')
             chrome_options.add_argument('--no-sandbox')
             chrome_options.add_argument('--disable-dev-shm-usage')
             chrome_options.add_argument('--disable-gpu')
@@ -126,57 +125,128 @@ class PellaAutoRenew:
             except:
                 continue
         
-        # 最后尝试提交表单
-        try:
-            self.driver.execute_script("document.querySelector('form').submit();")
-            logger.info("✅ 表单提交成功")
-            return True
-        except:
-            pass
-        
         return False
+
+    def wait_for_password_field(self, timeout=15):
+        """等待密码输入框出现（Clerk SPA 不会改变 URL）"""
+        password_selectors = [
+            "input[type='password']",
+            "input[name='password']",
+            "input.cl-formFieldInput[type='password']",
+            "#password",
+        ]
+        
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            for selector in password_selectors:
+                try:
+                    element = self.driver.find_element(By.CSS_SELECTOR, selector)
+                    if element.is_displayed():
+                        logger.info(f"✅ 密码框已出现: {selector}")
+                        return element
+                except:
+                    pass
+            time.sleep(0.5)
+        
+        return None
+
+    def check_for_error(self):
+        """检查页面是否有错误提示"""
+        error_selectors = [
+            ".cl-formFieldErrorText",
+            "[data-localization-key*='error']",
+            ".error-message",
+            "[class*='error']"
+        ]
+        
+        for selector in error_selectors:
+            try:
+                error = self.driver.find_element(By.CSS_SELECTOR, selector)
+                if error.is_displayed():
+                    return error.text
+            except:
+                pass
+        return None
 
     def login(self):
         logger.info(f"🔑 开始登录流程")
         self.driver.get(self.LOGIN_URL)
-        time.sleep(3)
+        time.sleep(4)
         
         def js_set_value(element, value):
-            self.driver.execute_script(f"arguments[0].value = '{value}';", element)
-            self.driver.execute_script("arguments[0].dispatchEvent(new Event('input', { bubbles: true }));", element)
-            self.driver.execute_script("arguments[0].dispatchEvent(new Event('change', { bubbles: true }));", element)
+            """使用多种方式确保值被正确输入"""
+            element.clear()
+            element.click()
+            time.sleep(0.2)
+            
+            # 方法1: 直接输入
+            element.send_keys(value)
+            time.sleep(0.2)
+            
+            # 方法2: JS 设置并触发事件
+            self.driver.execute_script("""
+                arguments[0].value = arguments[1];
+                arguments[0].dispatchEvent(new Event('input', { bubbles: true }));
+                arguments[0].dispatchEvent(new Event('change', { bubbles: true }));
+                arguments[0].dispatchEvent(new KeyboardEvent('keyup', { bubbles: true }));
+            """, element, value)
         
         # 1. 输入邮箱
         try:
             logger.info("🔍 查找邮箱输入框...")
             email_input = self.wait_for_element_present(By.CSS_SELECTOR, "input[name='identifier']", 15)
             js_set_value(email_input, self.email)
+            time.sleep(0.5)
+            
+            # 验证邮箱是否输入成功
+            actual_value = email_input.get_attribute('value')
+            if actual_value != self.email:
+                logger.warning(f"⚠️ 邮箱值不匹配，重试...")
+                email_input.clear()
+                email_input.send_keys(self.email)
+                
             logger.info("✅ 邮箱输入完成")
         except Exception as e:
             raise Exception(f"❌ 输入邮箱失败: {e}")
             
-        # 2. 点击第一个 Continue
+        # 2. 点击第一个 Continue 并等待密码框
         try:
             logger.info("🔍 点击 Continue 按钮...")
             time.sleep(1)
-            initial_url = self.driver.current_url
             
             if not self.find_and_click_button():
                 raise Exception("无法点击 Continue 按钮")
             
-            logger.info("⏳ 等待页面切换...")
-            WebDriverWait(self.driver, 10).until(EC.url_changes(initial_url))
-            logger.info("✅ 页面已切换")
-            time.sleep(2)
+            # ⚠️ 关键修复：不等待 URL 变化，而是等待密码框出现
+            logger.info("⏳ 等待密码输入框出现...")
+            password_input = self.wait_for_password_field(timeout=15)
+            
+            if not password_input:
+                # 检查是否有错误信息
+                error_msg = self.check_for_error()
+                if error_msg:
+                    raise Exception(f"登录错误: {error_msg}")
+                
+                # 保存截图用于调试
+                try:
+                    self.driver.save_screenshot("/tmp/clerk_debug.png")
+                    logger.info("📸 已保存调试截图")
+                except:
+                    pass
+                    
+                raise Exception("密码框未出现，可能邮箱无效或页面加载失败")
+            
+            logger.info("✅ 页面已切换到密码步骤")
+            time.sleep(1)
 
         except Exception as e:
             raise Exception(f"❌ 第一步失败: {e}")
 
         # 3. 输入密码
         try:
-            logger.info("⏳ 等待密码输入框...")
-            password_input = self.wait_for_element_present(By.CSS_SELECTOR, "input[type='password']", 15)
-            logger.info("✅ 密码输入框已出现")
+            logger.info("⏳ 输入密码...")
+            # 重新获取密码框确保是新的元素
+            password_input = self.wait_for_element_present(By.CSS_SELECTOR, "input[type='password']", 10)
             js_set_value(password_input, self.password)
             logger.info("✅ 密码输入完成")
         except Exception as e:
@@ -202,9 +272,14 @@ class PellaAutoRenew:
                 time.sleep(2)
                 current_url = self.driver.current_url
                 
-                if '/home' in current_url:
+                if '/home' in current_url or '/dashboard' in current_url:
                     logger.info(f"✅ 登录成功")
                     return True
+                
+                # 检查错误
+                error_msg = self.check_for_error()
+                if error_msg:
+                    raise Exception(f"登录失败: {error_msg}")
                 
                 if '/login' not in current_url and '/sign-in' not in current_url:
                     self.driver.get(self.HOME_URL)
