@@ -8,145 +8,35 @@ on:
 jobs:
   scrape:
     runs-on: ubuntu-latest
+
     permissions:
       contents: write
       actions: write
-    
+
     steps:
       - uses: actions/checkout@v4
-      
+
       - name: 设置 Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      
+
       - name: 安装依赖
         run: |
           pip install cloudscraper beautifulsoup4 lxml opencv-python-headless requests
-      
+
       - name: 运行爬虫
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
           TARGET_REPO: ${{ secrets.TARGET_REPO }}
-        run: python scripts/scraper.py
+        run: python scripts/img/scraper.py
 
-      # ========== 使用 API 更新 count.json ==========
       - name: 更新 count.json
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
           TARGET_REPO: ${{ secrets.TARGET_REPO }}
-        run: |
-          cat > update_count.py << 'EOF'
-          import os
-          import re
-          import json
-          import base64
-          import requests
+        run: python scripts/img/update_count.py
 
-          GH_TOKEN = os.environ['GH_TOKEN']
-          TARGET_REPO = os.environ['TARGET_REPO']
-          API_BASE = f"https://api.github.com/repos/{TARGET_REPO}"
-          HEADERS = {
-              "Authorization": f"token {GH_TOKEN}",
-              "Accept": "application/vnd.github+json"
-          }
-
-          def get_folder_files(folder):
-              """通过 Git Trees API 获取文件夹内所有文件（支持超过1000个）"""
-              # 先获取默认分支
-              repo_resp = requests.get(API_BASE, headers=HEADERS)
-              default_branch = repo_resp.json().get('default_branch', 'main')
-              
-              # 获取分支的最新 commit
-              ref_resp = requests.get(f"{API_BASE}/git/ref/heads/{default_branch}", headers=HEADERS)
-              if ref_resp.status_code != 200:
-                  print(f"获取分支失败: {ref_resp.text}")
-                  return []
-              commit_sha = ref_resp.json()['object']['sha']
-              
-              # 获取 commit 的 tree
-              commit_resp = requests.get(f"{API_BASE}/git/commits/{commit_sha}", headers=HEADERS)
-              tree_sha = commit_resp.json()['tree']['sha']
-              
-              # 递归获取整个 tree
-              tree_resp = requests.get(f"{API_BASE}/git/trees/{tree_sha}?recursive=1", headers=HEADERS)
-              if tree_resp.status_code != 200:
-                  print(f"获取 tree 失败: {tree_resp.text}")
-                  return []
-              
-              tree_data = tree_resp.json()
-              files = []
-              prefix = f"ri/{folder}/"
-              
-              for item in tree_data.get('tree', []):
-                  if item['type'] == 'blob' and item['path'].startswith(prefix):
-                      filename = item['path'][len(prefix):]
-                      match = re.match(r'^(\d+)\.webp$', filename)
-                      if match:
-                          files.append(int(match.group(1)))
-              
-              return sorted(files)
-
-          def get_existing_count_json():
-              """获取现有的 count.json 的 SHA（用于更新）"""
-              resp = requests.get(f"{API_BASE}/contents/ri/count.json", headers=HEADERS)
-              if resp.status_code == 200:
-                  return resp.json().get('sha')
-              return None
-
-          def update_count_json(content, sha=None):
-              """通过 API 创建或更新 count.json"""
-              data = {
-                  "message": "Auto update count.json",
-                  "content": base64.b64encode(content.encode()).decode()
-              }
-              if sha:
-                  data["sha"] = sha
-              
-              resp = requests.put(
-                  f"{API_BASE}/contents/ri/count.json",
-                  headers=HEADERS,
-                  json=data
-              )
-              return resp.status_code in [200, 201]
-
-          def main():
-              folders = ['hd', 'hl', 'vd', 'vl']
-              result = {}
-              
-              for folder in folders:
-                  files = get_folder_files(folder)
-                  
-                  if not files:
-                      result[folder] = {"max": 0, "exclude": []}
-                      print(f"{folder}: 空")
-                      continue
-                  
-                  max_num = max(files)
-                  file_set = set(files)
-                  exclude = [i for i in range(1, max_num + 1) if i not in file_set]
-                  
-                  result[folder] = {"max": max_num, "exclude": exclude}
-                  print(f"{folder}: max={max_num}, files={len(files)}, excluded={len(exclude)}")
-              
-              # 生成 JSON
-              content = json.dumps(result, separators=(',', ':'))
-              
-              # 获取现有文件的 SHA
-              sha = get_existing_count_json()
-              
-              # 更新文件
-              if update_count_json(content, sha):
-                  print("✅ count.json 更新成功!")
-              else:
-                  print("❌ count.json 更新失败!")
-
-          if __name__ == "__main__":
-              main()
-          EOF
-          
-          python update_count.py
-        
       - name: 清理工作流记录
         uses: Mattraks/delete-workflow-runs@v2
         with:
