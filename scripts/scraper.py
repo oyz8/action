@@ -30,8 +30,6 @@ MAX_404_COUNT = 5
 TARGET_REPO = os.environ.get("TARGET_REPO", "").strip()
 GITHUB_TOKEN = os.environ.get("GH_TOKEN", "").strip()
 TARGET_BRANCH = os.environ.get("TARGET_BRANCH", "main").strip()
-
-# Cloudflare Pages Deploy Hook URL（可空）
 CF_DEPLOY_HOOK = os.environ.get("CF_DEPLOY_HOOK", "").strip()
 
 IMAGES_DIR = "ri"
@@ -180,14 +178,20 @@ def release_number(counter: dict, num: int):
         counter["exclude"].sort()
 
 
-def get_tree_item(tree_sha: str, name: str):
+# ============ tree 扫描（修复重点） ============
+
+def fetch_tree(tree_sha: str):
+    """
+    获取一个 tree 的原始 JSON。
+    成功返回 dict；请求失败返回 None。
+    """
     resp = api_request("GET", f"{API_BASE}/git/trees/{tree_sha}")
     if resp is None or resp.status_code != 200:
-        return None, None
-    for item in resp.json().get("tree", []):
-        if item["path"] == name:
-            return item["sha"], item["type"]
-    return None, None
+        return None
+    try:
+        return resp.json()
+    except Exception:
+        return None
 
 
 def get_root_tree_sha():
@@ -206,31 +210,63 @@ def get_root_tree_sha():
 
 
 def scan_remote_count():
-    """逐级扫描远程 ri/{folder}，重建 count 结构。失败返回 None。"""
+    """
+    逐级扫描远程 ri/{folder}，重建 count 结构。
+
+    关键修复：
+      - 一次请求 root tree，一次请求 ri tree，缓存四个子目录 sha
+      - 任何 API 失败、tree 被截断，都返回 None
+      - 绝不把"请求失败"误判为"目录为空"
+    """
     root_sha = get_root_tree_sha()
     if not root_sha:
-        print("❌ 无法获取根 tree")
+        print("❌ 无法获取根 tree sha")
         return None
 
-    ri_sha, ri_type = get_tree_item(root_sha, IMAGES_DIR)
-    if not ri_sha or ri_type != "tree":
+    root_tree = fetch_tree(root_sha)
+    if root_tree is None:
+        print("❌ 获取根 tree 内容失败")
+        return None
+
+    ri_item = next(
+        (it for it in root_tree.get("tree", []) if it["path"] == IMAGES_DIR),
+        None,
+    )
+    if not ri_item or ri_item["type"] != "tree":
         print(f"❌ 找不到 {IMAGES_DIR} 目录")
         return None
 
+    ri_tree = fetch_tree(ri_item["sha"])
+    if ri_tree is None:
+        print(f"❌ 获取 {IMAGES_DIR} tree 内容失败")
+        return None
+
+    folder_sha_map = {}
+    for it in ri_tree.get("tree", []):
+        if it["type"] == "tree" and it["path"] in FOLDERS:
+            folder_sha_map[it["path"]] = it["sha"]
+
     result = {}
     for folder in FOLDERS:
-        folder_sha, folder_type = get_tree_item(ri_sha, folder)
-        if not folder_sha or folder_type != "tree":
+        sha = folder_sha_map.get(folder)
+
+        # 目录确实不存在 → 空目录
+        if not sha:
+            print(f"ℹ️ {folder}: 目录不存在，按空处理")
             result[folder] = {"max": 0, "exclude": []}
             continue
 
-        tree = api_request("GET", f"{API_BASE}/git/trees/{folder_sha}")
-        if tree is None or tree.status_code != 200:
-            print(f"❌ 获取 {folder} tree 失败")
+        tree = fetch_tree(sha)
+        if tree is None:
+            print(f"❌ 获取 {folder} tree 内容失败，中止扫描")
+            return None
+
+        if tree.get("truncated"):
+            print(f"❌ {folder} tree 被 GitHub 截断，无法可靠统计，中止扫描")
             return None
 
         nums = set()
-        for item in tree.json().get("tree", []):
+        for item in tree.get("tree", []):
             if item["type"] != "blob":
                 continue
             m = re.match(r"^(\d+)\.webp$", item["path"])
@@ -409,7 +445,6 @@ def process_page_local(page_id: int, hash_registry: dict, count: dict,
 
 
 def batch_upload_to_github(upload_queue: list, hash_registry: dict):
-    """返回 (success, fail)。"""
     print(f"\n{'=' * 60}")
     print(f"📤 开始批量上传 {len(upload_queue)} 个文件")
     print(f"{'=' * 60}\n")
@@ -446,7 +481,7 @@ def trigger_cf_deploy() -> bool:
         print("⏭️ 未配置 CF_DEPLOY_HOOK，跳过")
         return False
 
-    print(f"🚀 触发 Deploy Hook...")
+    print("🚀 触发 Deploy Hook...")
     for i in range(3):
         try:
             resp = requests.post(CF_DEPLOY_HOOK, timeout=30)
@@ -474,11 +509,7 @@ def main():
 
     print(f"📦 目标仓库: {TARGET_REPO}")
     print(f"📁 存储目录: /{IMAGES_DIR}/")
-    if CF_DEPLOY_HOOK:
-        print(f"🌐 CF Deploy Hook: 已配置")
-    else:
-        print(f"🌐 CF Deploy Hook: 未配置（跳过）")
-    print()
+    print(f"🌐 CF Deploy Hook: {'已配置' if CF_DEPLOY_HOOK else '未配置（跳过）'}\n")
 
     # ---- 加载远程状态 ----
     print("📥 获取远程数据...")
@@ -501,7 +532,7 @@ def main():
             shutil.rmtree(d)
     ensure_dir(LOCAL_DIR)
 
-    # ---- 阶段1: 本地处理 ----
+    # ---- 阶段1 ----
     print("=" * 60)
     print("📥 阶段1: 本地下载和处理")
     print("=" * 60)
@@ -531,7 +562,7 @@ def main():
     if os.path.exists(TEMP_DIR):
         shutil.rmtree(TEMP_DIR)
 
-    # ---- 阶段2: 上传 ----
+    # ---- 阶段2 ----
     print("\n" + "=" * 60)
     print("📤 阶段2: 批量上传到 GitHub")
     print("=" * 60)
@@ -551,7 +582,7 @@ def main():
     else:
         print("\n📭 没有新图片")
 
-    # ---- 阶段3: 重建 count.json ----
+    # ---- 阶段3 ----
     print("\n" + "=" * 60)
     print("🔢 阶段3: 重建 count.json")
     print("=" * 60)
@@ -563,9 +594,9 @@ def main():
             c = new_count[f]
             print(f"   {f}: max={c['max']}, exclude={len(c['exclude'])}")
     else:
-        print("⚠️ 远程扫描失败，count.json 未更新")
+        print("⚠️ 远程扫描失败，count.json 未更新（保留原值）")
 
-    # ---- 阶段4: 更新 progress ----
+    # ---- 阶段4 ----
     if all_ok:
         progress["last_id"] = last_success_id
         save_remote_json_if_changed(
@@ -574,7 +605,7 @@ def main():
     else:
         print("⚠️ 存在上传失败，progress.json 不前移")
 
-    # ---- 阶段5: 触发 Cloudflare Pages Deploy Hook ----
+    # ---- 阶段5 ----
     print("\n" + "=" * 60)
     print("🚀 阶段5: 触发 Cloudflare Pages Deploy Hook")
     print("=" * 60)
