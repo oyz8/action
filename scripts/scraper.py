@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 图片爬虫 + count.json 维护 + Cloudflare Pages Deploy Hook（合并版）
+哈希算法：Git blob SHA-1（与 GitHub blob SHA 完全一致）
 """
 
 import os
@@ -178,13 +179,10 @@ def release_number(counter: dict, num: int):
         counter["exclude"].sort()
 
 
-# ============ tree 扫描（修复重点） ============
+# ============ tree 扫描 ============
 
 def fetch_tree(tree_sha: str):
-    """
-    获取一个 tree 的原始 JSON。
-    成功返回 dict；请求失败返回 None。
-    """
+    """获取一个 tree 的原始 JSON。成功返回 dict；请求失败返回 None。"""
     resp = api_request("GET", f"{API_BASE}/git/trees/{tree_sha}")
     if resp is None or resp.status_code != 200:
         return None
@@ -210,14 +208,7 @@ def get_root_tree_sha():
 
 
 def scan_remote_count():
-    """
-    逐级扫描远程 ri/{folder}，重建 count 结构。
-
-    关键修复：
-      - 一次请求 root tree，一次请求 ri tree，缓存四个子目录 sha
-      - 任何 API 失败、tree 被截断，都返回 None
-      - 绝不把"请求失败"误判为"目录为空"
-    """
+    """逐级扫描远程 ri/{folder}，重建 count 结构。失败返回 None。"""
     root_sha = get_root_tree_sha()
     if not root_sha:
         print("❌ 无法获取根 tree sha")
@@ -250,7 +241,6 @@ def scan_remote_count():
     for folder in FOLDERS:
         sha = folder_sha_map.get(folder)
 
-        # 目录确实不存在 → 空目录
         if not sha:
             print(f"ℹ️ {folder}: 目录不存在，按空处理")
             result[folder] = {"max": 0, "exclude": []}
@@ -292,11 +282,18 @@ def build_url(page_id: int) -> str:
 
 
 def get_file_hash(filepath: str) -> str:
-    sha256 = hashlib.sha256()
+    """
+    计算 Git blob SHA-1，与 `git hash-object` 和 GitHub blob SHA 完全一致。
+
+    算法：SHA1("blob " + str(文件字节长度) + "\0" + 文件内容)
+    """
+    file_size = os.path.getsize(filepath)
+    sha1 = hashlib.sha1()
+    sha1.update(f"blob {file_size}\0".encode("utf-8"))
     with open(filepath, "rb") as f:
         for chunk in iter(lambda: f.read(8192), b""):
-            sha256.update(chunk)
-    return sha256.hexdigest()
+            sha1.update(chunk)
+    return sha1.hexdigest()
 
 
 def ensure_dir(path: str):
@@ -406,29 +403,32 @@ def process_page_local(page_id: int, hash_registry: dict, count: dict,
         if not download_image(img["url"], temp_path):
             continue
 
-        file_hash = get_file_hash(temp_path)
-        if file_hash in hash_registry:
-            print("  ⏭️ 跳过重复")
-            os.remove(temp_path)
-            continue
-
         info = analyze_image(temp_path)
         if not info:
             os.remove(temp_path)
             continue
 
         target_folder = info["folder"]
-        new_num = allocate_number(count[target_folder])
 
+        # 先转 webp 到临时位置，再算哈希（保证哈希对应最终上传的文件）
+        temp_webp = temp_path + ".webp"
+        if not convert_to_webp(temp_path, temp_webp):
+            os.remove(temp_path)
+            continue
+        os.remove(temp_path)
+
+        file_hash = get_file_hash(temp_webp)
+
+        if file_hash in hash_registry:
+            print("  ⏭️ 跳过重复")
+            os.remove(temp_webp)
+            continue
+
+        new_num = allocate_number(count[target_folder])
         local_folder = os.path.join(LOCAL_DIR, IMAGES_DIR, target_folder)
         ensure_dir(local_folder)
         local_path = os.path.join(local_folder, f"{new_num}.webp")
-
-        if not convert_to_webp(temp_path, local_path):
-            os.remove(temp_path)
-            release_number(count[target_folder], new_num)
-            continue
-        os.remove(temp_path)
+        os.replace(temp_webp, local_path)
 
         remote_path = f"{IMAGES_DIR}/{target_folder}/{new_num}.webp"
         upload_queue.append({
@@ -522,6 +522,7 @@ def main():
     for f in FOLDERS:
         c = count[f]
         print(f"   {f}: max={c['max']}, exclude={len(c['exclude'])}")
+    print(f"📋 注册表条目数: {len(hash_registry)}")
 
     current_id = progress.get("last_id", START_ID - 1) + 1
     print(f"📍 从 ID {current_id} 开始\n")
