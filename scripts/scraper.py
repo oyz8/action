@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-图片爬虫 + count.json 维护 + Cloudflare Pages Deploy Hook（合并版）
+图片爬虫 + count.json 维护 + Cloudflare Pages Deploy Hook（列表页版）
 哈希算法：Git blob SHA-1（与 GitHub blob SHA 完全一致）
+
+相比旧版：
+- 不再用数字 ID 猜 URL（网站已混用 slug，如 /archives/EVA.html）
+- 改为扫描首页 + AJAX 分页列表，抓取真实文章链接
+- progress.json 记录已处理文章 ID 集合（数字或 slug 均可）
 """
 
 import os
@@ -25,8 +30,11 @@ BATCH_SIZE = 100
 TEMP_DIR = "temp_download"
 LOCAL_DIR = "local_images"
 
-START_ID = 342
-MAX_404_COUNT = 5
+ARCHIVE_BASE = "https://img.hyun.cc/index.php/category/mn"
+MAX_LIST_PAGES = 20          # 每轮最多扫描多少列表页（首次跑旧仓库可调大，如 50）
+SLEEP_BETWEEN_PAGES = 1.0    # 列表页之间的间隔（秒）
+
+MAX_404_COUNT = 5            # 保留：单页连续 404 已不再作为终止条件，这里保留仅作诊断阈值
 
 TARGET_REPO = os.environ.get("TARGET_REPO", "").strip()
 GITHUB_TOKEN = os.environ.get("GH_TOKEN", "").strip()
@@ -275,11 +283,77 @@ def scan_remote_count():
     return result
 
 
+# ============ 文章列表抓取 ============
+
+def normalize_article_id(url: str) -> str:
+    """从文章 URL 里提取唯一标识（数字 ID 或 slug）。"""
+    m = re.search(r"/archives/([^/]+?)\.html", url)
+    return m.group(1) if m else url
+
+
+def fetch_archive_page(page_num: int):
+    """
+    返回 (文章URL列表, 是否有下一页)。
+    失败返回 (None, False)。
+    """
+    if page_num == 1:
+        url = f"{ARCHIVE_BASE}/"
+        headers = {}
+    else:
+        # 站点分页是 AJAX，加这个头才返回片段
+        url = f"{ARCHIVE_BASE}/index.php/page/{page_num}/?page={page_num}"
+        headers = {"X-Requested-With": "xmlhttprequest"}
+
+    try:
+        resp = scraper.get(url, headers=headers, timeout=30)
+        resp.raise_for_status()
+        resp.encoding = "utf-8"
+    except Exception as e:
+        print(f"❌ 获取列表页 {page_num} 失败: {e}")
+        return None, False
+
+    soup = BeautifulSoup(resp.text, "lxml")
+    container = soup.select_one(".ajax-container")
+    if not container:
+        return [], False
+
+    urls = []
+    for art in container.select("article.ajax-post"):
+        link = art.select_one("a[href*='/archives/']")
+        if not link:
+            continue
+        href = link.get("href", "").strip()
+        if href.startswith("/"):
+            href = ARCHIVE_BASE + href
+        if href:
+            urls.append(href)
+
+    has_next = soup.select_one("#ajax-page button") is not None
+    return urls, has_next
+
+
+def collect_article_urls(max_pages: int = MAX_LIST_PAGES):
+    """按最新→最旧收集列表页文章 URL（去重）。"""
+    all_urls, seen = [], set()
+    for page in range(1, max_pages + 1):
+        urls, has_next = fetch_archive_page(page)
+        if urls is None:
+            break
+        if not urls:
+            break
+        for u in urls:
+            aid = normalize_article_id(u)
+            if aid not in seen:
+                seen.add(aid)
+                all_urls.append(u)
+        print(f"  📄 列表第 {page} 页: {len(urls)} 篇（累计 {len(all_urls)}）")
+        if not has_next:
+            break
+        time.sleep(SLEEP_BETWEEN_PAGES)
+    return all_urls
+
+
 # ============ 工具函数 ============
-
-def build_url(page_id: int) -> str:
-    return f"https://img.hyun.cc/index.php/archives/{page_id}.html"
-
 
 def get_file_hash(filepath: str) -> str:
     """
@@ -382,11 +456,11 @@ def analyze_image(path: str):
 
 # ============ 页面处理 ============
 
-def process_page_local(page_id: int, hash_registry: dict, count: dict,
+def process_page_local(url: str, hash_registry: dict, count: dict,
                        upload_queue: list) -> str:
-    url = build_url(page_id)
+    article_id = normalize_article_id(url)
     print(f"\n{'=' * 50}")
-    print(f"📂 页面 ID: {page_id}")
+    print(f"📂 文章: {article_id}  ({url})")
     print(f"{'=' * 50}")
 
     ensure_dir(TEMP_DIR)
@@ -397,7 +471,9 @@ def process_page_local(page_id: int, hash_registry: dict, count: dict,
     new_count = 0
     for img in images[:BATCH_SIZE]:
         idx = img["index"]
-        temp_path = os.path.join(TEMP_DIR, f"temp_{page_id}_{idx}")
+        # article_id 可能是 slug（含非 ASCII），文件名里做一层安全处理
+        safe_id = re.sub(r"[^A-Za-z0-9_.-]", "_", article_id)
+        temp_path = os.path.join(TEMP_DIR, f"temp_{safe_id}_{idx}")
 
         print(f"📥 [{idx}/{min(len(images), BATCH_SIZE)}] 下载中...")
         if not download_image(img["url"], temp_path):
@@ -440,7 +516,7 @@ def process_page_local(page_id: int, hash_registry: dict, count: dict,
         new_count += 1
         print(f"  💾 {local_path}")
 
-    print(f"✅ 页面 {page_id} 完成，新增 {new_count} 张")
+    print(f"✅ 文章 {article_id} 完成，新增 {new_count} 张")
     return "success"
 
 
@@ -513,7 +589,11 @@ def main():
 
     # ---- 加载远程状态 ----
     print("📥 获取远程数据...")
-    progress = get_remote_json(PROGRESS_PATH, {"last_id": START_ID - 1})
+    progress = get_remote_json(PROGRESS_PATH, {})
+    processed = set(progress.get("processed", []))
+    if "last_id" in progress and not processed:
+        print("ℹ️ 检测到旧版 progress（last_id），本次将全量扫描列表页")
+
     hash_registry = get_remote_json(HASH_PATH, {})
     raw_count = get_remote_json(COUNT_PATH, {})
     count = load_count(raw_count)
@@ -523,9 +603,7 @@ def main():
         c = count[f]
         print(f"   {f}: max={c['max']}, exclude={len(c['exclude'])}")
     print(f"📋 注册表条目数: {len(hash_registry)}")
-
-    current_id = progress.get("last_id", START_ID - 1) + 1
-    print(f"📍 从 ID {current_id} 开始\n")
+    print(f"📋 已处理文章: {len(processed)}\n")
 
     # ---- 清理本地 ----
     for d in (LOCAL_DIR, TEMP_DIR):
@@ -533,37 +611,42 @@ def main():
             shutil.rmtree(d)
     ensure_dir(LOCAL_DIR)
 
-    # ---- 阶段1 ----
+    # ---- 阶段1：扫描列表页 + 本地下载处理 ----
     print("=" * 60)
-    print("📥 阶段1: 本地下载和处理")
+    print("📥 阶段1: 扫描列表页 + 本地下载处理")
     print("=" * 60)
+
+    article_urls = collect_article_urls(MAX_LIST_PAGES)
+    print(f"\n📋 共发现 {len(article_urls)} 篇文章")
+
+    new_urls = [u for u in article_urls
+                if normalize_article_id(u) not in processed]
+    print(f"📋 未处理: {len(new_urls)} 篇\n")
 
     upload_queue = []
-    last_success_id = current_id - 1
-    consecutive_404 = 0
+    processed_this_run = []
 
-    while True:
-        result = process_page_local(current_id, hash_registry, count, upload_queue)
+    # 列表页最新在前，反转后按时间顺序处理，编号更自然
+    for url in reversed(new_urls):
+        try:
+            result = process_page_local(url, hash_registry, count, upload_queue)
+        except Exception as e:
+            print(f"❌ 文章处理异常: {url} -> {e}")
+            result = "error"
 
         if result in ("success", "video"):
-            last_success_id = current_id
-            consecutive_404 = 0
-            current_id += 1
+            processed_this_run.append(normalize_article_id(url))
         elif result == "404":
-            consecutive_404 += 1
-            print(f"⚠️ 404 (连续: {consecutive_404}/{MAX_404_COUNT})")
-            if consecutive_404 >= MAX_404_COUNT:
-                print(f"\n⏹️ 连续 {MAX_404_COUNT} 个 404，到达末尾")
-                break
-            current_id += 1
+            # 单篇文章 404，不影响其他文章，直接跳过（仍记入已处理避免反复请求）
+            print(f"⚠️ 文章已失效/不存在，跳过: {url}")
+            processed_this_run.append(normalize_article_id(url))
         else:
-            print("\n❌ 处理出错，停止")
-            break
+            print(f"⚠️ 文章处理失败，本轮不记录，下次重试: {url}")
 
     if os.path.exists(TEMP_DIR):
         shutil.rmtree(TEMP_DIR)
 
-    # ---- 阶段2 ----
+    # ---- 阶段2：批量上传到 GitHub ----
     print("\n" + "=" * 60)
     print("📤 阶段2: 批量上传到 GitHub")
     print("=" * 60)
@@ -583,7 +666,7 @@ def main():
     else:
         print("\n📭 没有新图片")
 
-    # ---- 阶段3 ----
+    # ---- 阶段3：重建 count.json ----
     print("\n" + "=" * 60)
     print("🔢 阶段3: 重建 count.json")
     print("=" * 60)
@@ -597,16 +680,27 @@ def main():
     else:
         print("⚠️ 远程扫描失败，count.json 未更新（保留原值）")
 
-    # ---- 阶段4 ----
+    # ---- 阶段4：保存进度 ----
+    print("\n" + "=" * 60)
+    print("💾 阶段4: 保存 progress.json")
+    print("=" * 60)
+
     if all_ok:
-        progress["last_id"] = last_success_id
+        processed.update(processed_this_run)
+        progress = {
+            "processed": sorted(processed),
+            # 保留 last_id 字段便于兼容/观测，可选
+            "last_id": progress.get("last_id", 0),
+        }
         save_remote_json_if_changed(
-            PROGRESS_PATH, progress, f"Update progress to {last_success_id}"
+            PROGRESS_PATH, progress,
+            f"Update progress (+{len(processed_this_run)} articles)"
         )
+        print(f"   新增已处理: {len(processed_this_run)}，累计: {len(processed)}")
     else:
         print("⚠️ 存在上传失败，progress.json 不前移")
 
-    # ---- 阶段5 ----
+    # ---- 阶段5：触发 Cloudflare Pages Deploy Hook ----
     print("\n" + "=" * 60)
     print("🚀 阶段5: 触发 Cloudflare Pages Deploy Hook")
     print("=" * 60)
