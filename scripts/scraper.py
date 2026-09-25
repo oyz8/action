@@ -563,7 +563,7 @@ def main():
 
     print(f"📦 目标仓库: {TARGET_REPO}", flush=True)
     print(f"📁 存储目录: /{IMAGES_DIR}/", flush=True)
-    print(f"🌐 CF Deploy Hook: {'已配置' if CF_DEPLOY_HOOK else '未配置（跳过）'}\n", flush=True)
+    print(f"🌐 CF 部署钩子: {'已配置' if CF_DEPLOY_HOOK else '未配置（跳过）'}\n", flush=True)
 
     # ---- 加载远程状态 ----
     print("📥 获取远程数据...", flush=True)
