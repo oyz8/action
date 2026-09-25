@@ -30,7 +30,10 @@ jobs:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
           TARGET_REPO: ${{ secrets.TARGET_REPO }}
           CF_DEPLOY_HOOK: ${{ secrets.CF_DEPLOY_HOOK }}
-        run: python scripts/scraper.py
+          # 让 Python 日志实时输出到 Actions
+          PYTHONUNBUFFERED: "1"
+          PYTHONIOENCODING: "utf-8"
+        run: python -u scripts/scraper.py
 
       - name: 清理工作流记录
         uses: Mattraks/delete-workflow-runs@v2
