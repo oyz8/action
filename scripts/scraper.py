@@ -1,16 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-图片爬虫 + count.json 维护 + Cloudflare Pages Deploy Hook（列表页版）
-哈希算法：Git blob SHA-1（与 GitHub blob SHA 完全一致）
-
-相比旧版：
-- 不再用数字 ID 猜 URL（网站已混用 slug，如 /archives/EVA.html）
-- 改为扫描首页 + AJAX 分页列表，抓取真实文章链接
-- progress.json 记录已处理文章 ID 集合（数字或 slug 均可）
+图片爬虫 + count.json 维护 + Cloudflare Pages Deploy Hook
+- 固定抓分类页前两页：/index.php/category/mn/1/ 和 /2/
+- 每页是普通 HTML（非 AJAX），直接解析
+- 哈希算法：Git blob SHA-1（与 GitHub blob SHA 完全一致）
 """
 
 import os
+import sys
 import re
 import json
 import time
@@ -24,17 +22,27 @@ from bs4 import BeautifulSoup
 import cv2
 import requests
 
+# ---- 让 print 实时刷到 stdout（GitHub Actions 里很重要）----
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+except Exception:
+    pass
+
 # ==== 配置 ====
 BRIGHTNESS_THRESHOLD = 130
 BATCH_SIZE = 100
 TEMP_DIR = "temp_download"
 LOCAL_DIR = "local_images"
 
-ARCHIVE_BASE = "https://img.hyun.cc/index.php/category/mn"
-MAX_LIST_PAGES = 20          # 每轮最多扫描多少列表页（首次跑旧仓库可调大，如 50）
-SLEEP_BETWEEN_PAGES = 1.0    # 列表页之间的间隔（秒）
+ARCHIVE_BASE = "https://img.hyun.cc"
 
-MAX_404_COUNT = 5            # 保留：单页连续 404 已不再作为终止条件，这里保留仅作诊断阈值
+# 只抓这两个固定分类页（永远指向最新内容）
+CATEGORY_PAGES = [
+    f"{ARCHIVE_BASE}/index.php/category/mn/1/",
+    f"{ARCHIVE_BASE}/index.php/category/mn/2/",
+]
+SLEEP_BETWEEN_PAGES = 1.0
 
 TARGET_REPO = os.environ.get("TARGET_REPO", "").strip()
 GITHUB_TOKEN = os.environ.get("GH_TOKEN", "").strip()
@@ -64,7 +72,6 @@ scraper = cloudscraper.create_scraper(
 # ============ GitHub API ============
 
 def api_request(method: str, url: str, retries: int = 5, **kwargs):
-    """统一 GitHub API 请求，带自动重试。返回 response 或 None。"""
     for i in range(retries):
         try:
             resp = requests.request(
@@ -72,7 +79,7 @@ def api_request(method: str, url: str, retries: int = 5, **kwargs):
             )
         except requests.RequestException as e:
             wait = min(2 ** i, 30)
-            print(f"⚠️ 请求异常: {e}，{wait}s 后重试")
+            print(f"⚠️ 请求异常: {e}，{wait}s 后重试", flush=True)
             time.sleep(wait)
             continue
 
@@ -83,14 +90,14 @@ def api_request(method: str, url: str, retries: int = 5, **kwargs):
             retry_after = resp.headers.get("Retry-After")
             if retry_after and retry_after.isdigit():
                 wait = int(retry_after)
-                print(f"⚠️ 限流，等待 {wait}s")
+                print(f"⚠️ 限流，等待 {wait}s", flush=True)
                 time.sleep(wait)
                 continue
             return resp
 
         if resp.status_code == 429 or resp.status_code >= 500:
             wait = min(2 ** i, 30)
-            print(f"⚠️ API {resp.status_code}，{wait}s 后重试: {url}")
+            print(f"⚠️ API {resp.status_code}，{wait}s 后重试: {url}", flush=True)
             time.sleep(wait)
             continue
 
@@ -100,7 +107,6 @@ def api_request(method: str, url: str, retries: int = 5, **kwargs):
 
 
 def github_get_file(path: str):
-    """返回 (content_str, sha)，不存在返回 (None, None)。"""
     resp = api_request("GET", f"{API_BASE}/contents/{path}")
     if resp is None or resp.status_code != 200:
         return None, None
@@ -109,7 +115,7 @@ def github_get_file(path: str):
         content = base64.b64decode(data["content"]).decode("utf-8")
         return content, data.get("sha")
     except Exception as e:
-        print(f"⚠️ 解析 {path} 失败: {e}")
+        print(f"⚠️ 解析 {path} 失败: {e}", flush=True)
         return None, None
 
 
@@ -127,7 +133,7 @@ def github_upload(path: str, content: bytes, message: str, sha: str = None) -> b
         return False
     if resp.status_code in (200, 201):
         return True
-    print(f"❌ 上传失败 {path}: {resp.status_code} {resp.text[:200]}")
+    print(f"❌ 上传失败 {path}: {resp.status_code} {resp.text[:200]}", flush=True)
     return False
 
 
@@ -142,14 +148,13 @@ def get_remote_json(path: str, default=None) -> dict:
 
 
 def save_remote_json_if_changed(path: str, data, message: str) -> bool:
-    """内容没有变化就不提交，避免空 commit。"""
     old_content, sha = github_get_file(path)
     new_content = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
 
     if old_content is not None:
         try:
             if json.loads(old_content) == data:
-                print(f"⏭️ {path} 无变化，跳过")
+                print(f"⏭️ {path} 无变化，跳过", flush=True)
                 return True
         except json.JSONDecodeError:
             pass
@@ -181,16 +186,9 @@ def allocate_number(counter: dict) -> int:
     return counter["max"]
 
 
-def release_number(counter: dict, num: int):
-    if num not in counter["exclude"] and num <= counter["max"]:
-        counter["exclude"].append(num)
-        counter["exclude"].sort()
-
-
 # ============ tree 扫描 ============
 
 def fetch_tree(tree_sha: str):
-    """获取一个 tree 的原始 JSON。成功返回 dict；请求失败返回 None。"""
     resp = api_request("GET", f"{API_BASE}/git/trees/{tree_sha}")
     if resp is None or resp.status_code != 200:
         return None
@@ -216,15 +214,14 @@ def get_root_tree_sha():
 
 
 def scan_remote_count():
-    """逐级扫描远程 ri/{folder}，重建 count 结构。失败返回 None。"""
     root_sha = get_root_tree_sha()
     if not root_sha:
-        print("❌ 无法获取根 tree sha")
+        print("❌ 无法获取根 tree sha", flush=True)
         return None
 
     root_tree = fetch_tree(root_sha)
     if root_tree is None:
-        print("❌ 获取根 tree 内容失败")
+        print("❌ 获取根 tree 内容失败", flush=True)
         return None
 
     ri_item = next(
@@ -232,12 +229,12 @@ def scan_remote_count():
         None,
     )
     if not ri_item or ri_item["type"] != "tree":
-        print(f"❌ 找不到 {IMAGES_DIR} 目录")
+        print(f"❌ 找不到 {IMAGES_DIR} 目录", flush=True)
         return None
 
     ri_tree = fetch_tree(ri_item["sha"])
     if ri_tree is None:
-        print(f"❌ 获取 {IMAGES_DIR} tree 内容失败")
+        print(f"❌ 获取 {IMAGES_DIR} tree 内容失败", flush=True)
         return None
 
     folder_sha_map = {}
@@ -250,17 +247,17 @@ def scan_remote_count():
         sha = folder_sha_map.get(folder)
 
         if not sha:
-            print(f"ℹ️ {folder}: 目录不存在，按空处理")
+            print(f"ℹ️ {folder}: 目录不存在，按空处理", flush=True)
             result[folder] = {"max": 0, "exclude": []}
             continue
 
         tree = fetch_tree(sha)
         if tree is None:
-            print(f"❌ 获取 {folder} tree 内容失败，中止扫描")
+            print(f"❌ 获取 {folder} tree 内容失败，中止扫描", flush=True)
             return None
 
         if tree.get("truncated"):
-            print(f"❌ {folder} tree 被 GitHub 截断，无法可靠统计，中止扫描")
+            print(f"❌ {folder} tree 被 GitHub 截断，无法可靠统计，中止扫描", flush=True)
             return None
 
         nums = set()
@@ -283,39 +280,31 @@ def scan_remote_count():
     return result
 
 
-# ============ 文章列表抓取 ============
+# ============ 文章列表抓取（固定分类页）============
 
 def normalize_article_id(url: str) -> str:
-    """从文章 URL 里提取唯一标识（数字 ID 或 slug）。"""
     m = re.search(r"/archives/([^/]+?)\.html", url)
     return m.group(1) if m else url
 
 
-def fetch_archive_page(page_num: int):
-    """
-    返回 (文章URL列表, 是否有下一页)。
-    失败返回 (None, False)。
-    """
-    if page_num == 1:
-        url = f"{ARCHIVE_BASE}/"
-        headers = {}
-    else:
-        # 站点分页是 AJAX，加这个头才返回片段
-        url = f"{ARCHIVE_BASE}/index.php/page/{page_num}/?page={page_num}"
-        headers = {"X-Requested-With": "xmlhttprequest"}
-
+def fetch_category_articles(page_url: str):
+    """抓一个分类页里的所有文章 URL。失败返回 None。"""
+    print(f"🌐 抓分类页: {page_url}", flush=True)
     try:
-        resp = scraper.get(url, headers=headers, timeout=30)
+        resp = scraper.get(page_url, timeout=30)
         resp.raise_for_status()
         resp.encoding = "utf-8"
     except Exception as e:
-        print(f"❌ 获取列表页 {page_num} 失败: {e}")
-        return None, False
+        print(f"❌ 获取分类页失败: {page_url} -> {e}", flush=True)
+        return None
 
     soup = BeautifulSoup(resp.text, "lxml")
-    container = soup.select_one(".ajax-container")
+
+    # 分类页的文章容器
+    container = soup.select_one("#grid.ajax-container") or soup.select_one(".ajax-container")
     if not container:
-        return [], False
+        print(f"⚠️ 分类页里找不到文章容器: {page_url}", flush=True)
+        return []
 
     urls = []
     for art in container.select("article.ajax-post"):
@@ -328,27 +317,23 @@ def fetch_archive_page(page_num: int):
         if href:
             urls.append(href)
 
-    has_next = soup.select_one("#ajax-page button") is not None
-    return urls, has_next
+    print(f"   📄 解析到 {len(urls)} 篇文章", flush=True)
+    return urls
 
 
-def collect_article_urls(max_pages: int = MAX_LIST_PAGES):
-    """按最新→最旧收集列表页文章 URL（去重）。"""
+def collect_article_urls():
+    """遍历固定的分类页，去重后返回文章 URL 列表。"""
     all_urls, seen = [], set()
-    for page in range(1, max_pages + 1):
-        urls, has_next = fetch_archive_page(page)
+    for page_url in CATEGORY_PAGES:
+        urls = fetch_category_articles(page_url)
         if urls is None:
-            break
-        if not urls:
-            break
+            # 单页失败不致命，继续下一页
+            continue
         for u in urls:
             aid = normalize_article_id(u)
             if aid not in seen:
                 seen.add(aid)
                 all_urls.append(u)
-        print(f"  📄 列表第 {page} 页: {len(urls)} 篇（累计 {len(all_urls)}）")
-        if not has_next:
-            break
         time.sleep(SLEEP_BETWEEN_PAGES)
     return all_urls
 
@@ -356,11 +341,6 @@ def collect_article_urls(max_pages: int = MAX_LIST_PAGES):
 # ============ 工具函数 ============
 
 def get_file_hash(filepath: str) -> str:
-    """
-    计算 Git blob SHA-1，与 `git hash-object` 和 GitHub blob SHA 完全一致。
-
-    算法：SHA1("blob " + str(文件字节长度) + "\0" + 文件内容)
-    """
     file_size = os.path.getsize(filepath)
     sha1 = hashlib.sha1()
     sha1.update(f"blob {file_size}\0".encode("utf-8"))
@@ -377,7 +357,7 @@ def ensure_dir(path: str):
 # ============ 图片处理 ============
 
 def scrape_images(url: str):
-    print(f"🌐 爬取: {url}")
+    print(f"🌐 爬取文章: {url}", flush=True)
     try:
         resp = scraper.get(url, timeout=30)
         if resp.status_code == 404:
@@ -387,10 +367,10 @@ def scrape_images(url: str):
     except requests.exceptions.HTTPError as e:
         if "404" in str(e):
             return [], "404"
-        print(f"❌ 请求失败: {e}")
+        print(f"❌ 请求失败: {e}", flush=True)
         return [], "error"
     except Exception as e:
-        print(f"❌ 请求失败: {e}")
+        print(f"❌ 请求失败: {e}", flush=True)
         return [], "error"
 
     soup = BeautifulSoup(resp.text, "lxml")
@@ -401,10 +381,10 @@ def scrape_images(url: str):
             images.append({"url": href, "index": idx})
 
     if not images:
-        print("🎬 无图片（视频页面），跳过")
+        print("🎬 无图片（视频页面），跳过", flush=True)
         return [], "video"
 
-    print(f"📷 找到 {len(images)} 张图片")
+    print(f"📷 找到 {len(images)} 张图片", flush=True)
     return images, "ok"
 
 
@@ -417,7 +397,7 @@ def download_image(url: str, save_path: str) -> bool:
                 f.write(chunk)
         return True
     except Exception as e:
-        print(f"❌ 下载失败: {e}")
+        print(f"❌ 下载失败: {e}", flush=True)
         return False
 
 
@@ -447,10 +427,10 @@ def analyze_image(path: str):
         brightness = "d" if avg_l < BRIGHTNESS_THRESHOLD else "l"
 
         folder = orientation + brightness
-        print(f"  📐 {w}x{h} L={avg_l:.1f} → {folder}")
+        print(f"  📐 {w}x{h} L={avg_l:.1f} → {folder}", flush=True)
         return {"folder": folder}
     except Exception as e:
-        print(f"❌ 分析失败: {e}")
+        print(f"❌ 分析失败: {e}", flush=True)
         return None
 
 
@@ -459,9 +439,9 @@ def analyze_image(path: str):
 def process_page_local(url: str, hash_registry: dict, count: dict,
                        upload_queue: list) -> str:
     article_id = normalize_article_id(url)
-    print(f"\n{'=' * 50}")
-    print(f"📂 文章: {article_id}  ({url})")
-    print(f"{'=' * 50}")
+    print(f"\n{'=' * 50}", flush=True)
+    print(f"📂 文章: {article_id}  ({url})", flush=True)
+    print(f"{'=' * 50}", flush=True)
 
     ensure_dir(TEMP_DIR)
     images, status = scrape_images(url)
@@ -471,11 +451,10 @@ def process_page_local(url: str, hash_registry: dict, count: dict,
     new_count = 0
     for img in images[:BATCH_SIZE]:
         idx = img["index"]
-        # article_id 可能是 slug（含非 ASCII），文件名里做一层安全处理
         safe_id = re.sub(r"[^A-Za-z0-9_.-]", "_", article_id)
         temp_path = os.path.join(TEMP_DIR, f"temp_{safe_id}_{idx}")
 
-        print(f"📥 [{idx}/{min(len(images), BATCH_SIZE)}] 下载中...")
+        print(f"📥 [{idx}/{min(len(images), BATCH_SIZE)}] 下载中...", flush=True)
         if not download_image(img["url"], temp_path):
             continue
 
@@ -486,7 +465,6 @@ def process_page_local(url: str, hash_registry: dict, count: dict,
 
         target_folder = info["folder"]
 
-        # 先转 webp 到临时位置，再算哈希（保证哈希对应最终上传的文件）
         temp_webp = temp_path + ".webp"
         if not convert_to_webp(temp_path, temp_webp):
             os.remove(temp_path)
@@ -496,7 +474,7 @@ def process_page_local(url: str, hash_registry: dict, count: dict,
         file_hash = get_file_hash(temp_webp)
 
         if file_hash in hash_registry:
-            print("  ⏭️ 跳过重复")
+            print("  ⏭️ 跳过重复", flush=True)
             os.remove(temp_webp)
             continue
 
@@ -514,39 +492,39 @@ def process_page_local(url: str, hash_registry: dict, count: dict,
         })
         hash_registry[file_hash] = f"{target_folder}/{new_num}.webp"
         new_count += 1
-        print(f"  💾 {local_path}")
+        print(f"  💾 {local_path}", flush=True)
 
-    print(f"✅ 文章 {article_id} 完成，新增 {new_count} 张")
+    print(f"✅ 文章 {article_id} 完成，新增 {new_count} 张", flush=True)
     return "success"
 
 
 def batch_upload_to_github(upload_queue: list, hash_registry: dict):
-    print(f"\n{'=' * 60}")
-    print(f"📤 开始批量上传 {len(upload_queue)} 个文件")
-    print(f"{'=' * 60}\n")
+    print(f"\n{'=' * 60}", flush=True)
+    print(f"📤 开始批量上传 {len(upload_queue)} 个文件", flush=True)
+    print(f"{'=' * 60}\n", flush=True)
 
     success = 0
     fail = 0
 
     for idx, item in enumerate(upload_queue, 1):
-        print(f"[{idx}/{len(upload_queue)}] {item['remote_path']}", end=" ")
+        print(f"[{idx}/{len(upload_queue)}] {item['remote_path']}", end=" ", flush=True)
         try:
             with open(item["local_path"], "rb") as f:
                 content = f.read()
             if github_upload(item["remote_path"], content,
                              f"Add {item['remote_path']}"):
                 success += 1
-                print("✅")
+                print("✅", flush=True)
             else:
                 fail += 1
-                print("❌")
+                print("❌", flush=True)
                 hash_registry.pop(item["hash"], None)
         except Exception as e:
             fail += 1
-            print(f"❌ {e}")
+            print(f"❌ {e}", flush=True)
             hash_registry.pop(item["hash"], None)
 
-    print(f"\n📊 上传完成: 成功 {success}, 失败 {fail}")
+    print(f"\n📊 上传完成: 成功 {success}, 失败 {fail}", flush=True)
     return success, fail
 
 
@@ -554,56 +532,56 @@ def batch_upload_to_github(upload_queue: list, hash_registry: dict):
 
 def trigger_cf_deploy() -> bool:
     if not CF_DEPLOY_HOOK:
-        print("⏭️ 未配置 CF_DEPLOY_HOOK，跳过")
+        print("⏭️ 未配置 CF_DEPLOY_HOOK，跳过", flush=True)
         return False
 
-    print("🚀 触发 Deploy Hook...")
+    print("🚀 触发 Deploy Hook...", flush=True)
     for i in range(3):
         try:
             resp = requests.post(CF_DEPLOY_HOOK, timeout=30)
             if resp.status_code in (200, 201):
-                print(f"✅ Deploy Hook 已触发: {resp.status_code}")
+                print(f"✅ Deploy Hook 已触发: {resp.status_code}", flush=True)
                 return True
-            print(f"⚠️ Deploy Hook 返回 {resp.status_code}: {resp.text[:200]}")
+            print(f"⚠️ Deploy Hook 返回 {resp.status_code}: {resp.text[:200]}", flush=True)
         except Exception as e:
-            print(f"⚠️ Deploy Hook 请求异常: {e}")
+            print(f"⚠️ Deploy Hook 请求异常: {e}", flush=True)
         time.sleep(2 ** i)
 
-    print("❌ Deploy Hook 触发失败")
+    print("❌ Deploy Hook 触发失败", flush=True)
     return False
 
 
 # ============ 主函数 ============
 
 def main():
-    print("🚀 开始运行\n")
+    print("🚀 开始运行\n", flush=True)
 
     if not GITHUB_TOKEN:
         raise SystemExit("❌ 缺少 GH_TOKEN")
     if not TARGET_REPO or "/" not in TARGET_REPO:
         raise SystemExit("❌ 缺少 TARGET_REPO (owner/repo)")
 
-    print(f"📦 目标仓库: {TARGET_REPO}")
-    print(f"📁 存储目录: /{IMAGES_DIR}/")
-    print(f"🌐 CF Deploy Hook: {'已配置' if CF_DEPLOY_HOOK else '未配置（跳过）'}\n")
+    print(f"📦 目标仓库: {TARGET_REPO}", flush=True)
+    print(f"📁 存储目录: /{IMAGES_DIR}/", flush=True)
+    print(f"🌐 CF Deploy Hook: {'已配置' if CF_DEPLOY_HOOK else '未配置（跳过）'}\n", flush=True)
 
     # ---- 加载远程状态 ----
-    print("📥 获取远程数据...")
+    print("📥 获取远程数据...", flush=True)
     progress = get_remote_json(PROGRESS_PATH, {})
     processed = set(progress.get("processed", []))
     if "last_id" in progress and not processed:
-        print("ℹ️ 检测到旧版 progress（last_id），本次将全量扫描列表页")
+        print("ℹ️ 检测到旧版 progress（last_id），本次将重新扫描分类页", flush=True)
 
     hash_registry = get_remote_json(HASH_PATH, {})
     raw_count = get_remote_json(COUNT_PATH, {})
     count = load_count(raw_count)
 
-    print("📊 当前计数:")
+    print("📊 当前计数:", flush=True)
     for f in FOLDERS:
         c = count[f]
-        print(f"   {f}: max={c['max']}, exclude={len(c['exclude'])}")
-    print(f"📋 注册表条目数: {len(hash_registry)}")
-    print(f"📋 已处理文章: {len(processed)}\n")
+        print(f"   {f}: max={c['max']}, exclude={len(c['exclude'])}", flush=True)
+    print(f"📋 注册表条目数: {len(hash_registry)}", flush=True)
+    print(f"📋 已处理文章: {len(processed)}\n", flush=True)
 
     # ---- 清理本地 ----
     for d in (LOCAL_DIR, TEMP_DIR):
@@ -611,104 +589,102 @@ def main():
             shutil.rmtree(d)
     ensure_dir(LOCAL_DIR)
 
-    # ---- 阶段1：扫描列表页 + 本地下载处理 ----
-    print("=" * 60)
-    print("📥 阶段1: 扫描列表页 + 本地下载处理")
-    print("=" * 60)
+    # ---- 阶段1：扫分类页 + 本地下载处理 ----
+    print("=" * 60, flush=True)
+    print("📥 阶段1: 扫描分类页 + 本地下载处理", flush=True)
+    print("=" * 60, flush=True)
 
-    article_urls = collect_article_urls(MAX_LIST_PAGES)
-    print(f"\n📋 共发现 {len(article_urls)} 篇文章")
+    article_urls = collect_article_urls()
+    print(f"\n📋 共发现 {len(article_urls)} 篇文章", flush=True)
 
     new_urls = [u for u in article_urls
                 if normalize_article_id(u) not in processed]
-    print(f"📋 未处理: {len(new_urls)} 篇\n")
+    print(f"📋 未处理: {len(new_urls)} 篇\n", flush=True)
 
     upload_queue = []
     processed_this_run = []
 
-    # 列表页最新在前，反转后按时间顺序处理，编号更自然
+    # 分类页是最新在前，反转后按时间顺序处理，编号更自然
     for url in reversed(new_urls):
         try:
             result = process_page_local(url, hash_registry, count, upload_queue)
         except Exception as e:
-            print(f"❌ 文章处理异常: {url} -> {e}")
+            print(f"❌ 文章处理异常: {url} -> {e}", flush=True)
             result = "error"
 
         if result in ("success", "video"):
             processed_this_run.append(normalize_article_id(url))
         elif result == "404":
-            # 单篇文章 404，不影响其他文章，直接跳过（仍记入已处理避免反复请求）
-            print(f"⚠️ 文章已失效/不存在，跳过: {url}")
+            print(f"⚠️ 文章已失效/不存在，跳过: {url}", flush=True)
             processed_this_run.append(normalize_article_id(url))
         else:
-            print(f"⚠️ 文章处理失败，本轮不记录，下次重试: {url}")
+            print(f"⚠️ 文章处理失败，本轮不记录，下次重试: {url}", flush=True)
 
     if os.path.exists(TEMP_DIR):
         shutil.rmtree(TEMP_DIR)
 
-    # ---- 阶段2：批量上传到 GitHub ----
-    print("\n" + "=" * 60)
-    print("📤 阶段2: 批量上传到 GitHub")
-    print("=" * 60)
+    # ---- 阶段2：批量上传 ----
+    print("\n" + "=" * 60, flush=True)
+    print("📤 阶段2: 批量上传到 GitHub", flush=True)
+    print("=" * 60, flush=True)
 
     uploaded_count = 0
     all_ok = True
     if upload_queue:
-        print(f"\n📊 待上传: {len(upload_queue)} 个文件")
+        print(f"\n📊 待上传: {len(upload_queue)} 个文件", flush=True)
         for f in FOLDERS:
             n = sum(1 for it in upload_queue if f"/{f}/" in it["remote_path"])
             if n:
-                print(f"   {f}: {n} 张")
+                print(f"   {f}: {n} 张", flush=True)
         uploaded_count, fail = batch_upload_to_github(upload_queue, hash_registry)
         all_ok = (fail == 0)
         save_remote_json_if_changed(HASH_PATH, hash_registry,
                                     "Update hash_registry")
     else:
-        print("\n📭 没有新图片")
+        print("\n📭 没有新图片", flush=True)
 
     # ---- 阶段3：重建 count.json ----
-    print("\n" + "=" * 60)
-    print("🔢 阶段3: 重建 count.json")
-    print("=" * 60)
+    print("\n" + "=" * 60, flush=True)
+    print("🔢 阶段3: 重建 count.json", flush=True)
+    print("=" * 60, flush=True)
 
     new_count = scan_remote_count()
     if new_count is not None:
         save_remote_json_if_changed(COUNT_PATH, new_count, "Update count.json")
         for f in FOLDERS:
             c = new_count[f]
-            print(f"   {f}: max={c['max']}, exclude={len(c['exclude'])}")
+            print(f"   {f}: max={c['max']}, exclude={len(c['exclude'])}", flush=True)
     else:
-        print("⚠️ 远程扫描失败，count.json 未更新（保留原值）")
+        print("⚠️ 远程扫描失败，count.json 未更新（保留原值）", flush=True)
 
     # ---- 阶段4：保存进度 ----
-    print("\n" + "=" * 60)
-    print("💾 阶段4: 保存 progress.json")
-    print("=" * 60)
+    print("\n" + "=" * 60, flush=True)
+    print("💾 阶段4: 保存 progress.json", flush=True)
+    print("=" * 60, flush=True)
 
     if all_ok:
         processed.update(processed_this_run)
         progress = {
             "processed": sorted(processed),
-            # 保留 last_id 字段便于兼容/观测，可选
             "last_id": progress.get("last_id", 0),
         }
         save_remote_json_if_changed(
             PROGRESS_PATH, progress,
             f"Update progress (+{len(processed_this_run)} articles)"
         )
-        print(f"   新增已处理: {len(processed_this_run)}，累计: {len(processed)}")
+        print(f"   新增已处理: {len(processed_this_run)}，累计: {len(processed)}", flush=True)
     else:
-        print("⚠️ 存在上传失败，progress.json 不前移")
+        print("⚠️ 存在上传失败，progress.json 不前移", flush=True)
 
-    # ---- 阶段5：触发 Cloudflare Pages Deploy Hook ----
-    print("\n" + "=" * 60)
-    print("🚀 阶段5: 触发 Cloudflare Pages Deploy Hook")
-    print("=" * 60)
+    # ---- 阶段5：Deploy Hook ----
+    print("\n" + "=" * 60, flush=True)
+    print("🚀 阶段5: 触发 Cloudflare Pages Deploy Hook", flush=True)
+    print("=" * 60, flush=True)
 
     if not all_ok:
-        print("⏭️ 存在上传失败，跳过 Deploy Hook")
+        print("⏭️ 存在上传失败，跳过 Deploy Hook", flush=True)
     elif uploaded_count == 0:
-        print("⏭️ 本轮没有新文件上传，跳过 Deploy Hook")
+        print("⏭️ 本轮没有新文件上传，跳过 Deploy Hook", flush=True)
     else:
         trigger_cf_deploy()
 
@@ -716,7 +692,7 @@ def main():
     if os.path.exists(LOCAL_DIR):
         shutil.rmtree(LOCAL_DIR)
 
-    print("\n🏁 完成")
+    print("\n🏁 完成", flush=True)
 
 
 if __name__ == "__main__":
