@@ -678,13 +678,13 @@ def main():
 
     # ---- 阶段5：Deploy Hook ----
     print("\n" + "=" * 60, flush=True)
-    print("🚀 阶段5: 触发 Cloudflare Pages Deploy Hook", flush=True)
+    print("🚀 阶段5: 触发 Cloudflare Pages 部署钩子", flush=True)
     print("=" * 60, flush=True)
 
     if not all_ok:
-        print("⏭️ 存在上传失败，跳过 Deploy Hook", flush=True)
+        print("⏭️ 存在上传失败，跳过部署钩子", flush=True)
     elif uploaded_count == 0:
-        print("⏭️ 本轮没有新文件上传，跳过 Deploy Hook", flush=True)
+        print("⏭️ 本轮没有新文件上传，跳过部署钩子", flush=True)
     else:
         trigger_cf_deploy()
 
