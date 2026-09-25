@@ -36,7 +36,7 @@ CF_DEPLOY_HOOK = os.environ.get("CF_DEPLOY_HOOK", "").strip()
 IMAGES_DIR = "ri"
 FOLDERS = ["hd", "hl", "vd", "vl"]
 
-PROGRESS_PATH = "{IMAGES_DIR}/progress.json"
+PROGRESS_PATH = f"{IMAGES_DIR}/progress.json"
 COUNT_PATH = f"{IMAGES_DIR}/count.json"
 HASH_PATH = f"{IMAGES_DIR}/hash_registry.json"
 
